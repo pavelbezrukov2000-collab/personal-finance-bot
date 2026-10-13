@@ -14,7 +14,15 @@ PLACES = ["Еда","Напитки","Магазины у дома","Аллея",
 
 def ws():
     if not SERVICE_JSON: raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not configured")
-    info = json.loads(SERVICE_JSON)
+    if SERVICE_JSON.lower().endswith(".json"):
+        candidates = [SERVICE_JSON, f"/app/{SERVICE_JSON}", f"/app/data/{SERVICE_JSON}"]
+        file_path = next((p for p in candidates if os.path.exists(p)), None)
+        if not file_path:
+            raise RuntimeError(f"Google service-account file not found: {SERVICE_JSON}")
+        with open(file_path, "r", encoding="utf-8") as fh:
+            info = json.load(fh)
+    else:
+        info = json.loads(SERVICE_JSON)
     creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     return gspread.authorize(creds).open_by_key(SHEET_ID)
 
@@ -30,16 +38,70 @@ def add_operation(kind, amount, place):
     else: row = 103
     sh.update(f"A{row}:E{row}", [[datetime.now().strftime("%d.%m.%Y"), kind, place, place, float(amount)]], value_input_option="USER_ENTERED")
 
+def add_income(amount, source):
+    sh = month_ws(); existing = sh.get("T3:T12"); row = 3
+    for i, r in enumerate(existing, start=3):
+        if not r or not r[0]: row = i; break
+    else: row = 13
+    sh.update(f"T{row}:U{row}", [[source, float(amount)]], value_input_option="USER_ENTERED")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [["Доход", "Расход"], ["Долги на сейчас", "Отчёт за сегодня"]]
+    kb = [["Доход", "Расход"], ["Кредиты", "Долги на сейчас"], ["Отчёт за сегодня"]]
     await update.message.reply_text("Выберите действие:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
 async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text
+    step = context.user_data.get("step")
+    if t == "Кредиты":
+        kb = [["Добавить кредит", "Внести платёж"], ["Назад"]]
+        context.user_data["step"] = "credit_menu"
+        return await update.message.reply_text("Выберите действие с кредитом:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+    if t == "Назад":
+        context.user_data.clear()
+        return await start(update, context)
+    if step == "credit_menu":
+        if t == "Добавить кредит":
+            context.user_data["step"] = "credit_name"
+            return await update.message.reply_text("Напишите название кредитора:")
+        if t == "Внести платёж":
+            context.user_data["step"] = "credit_payment_name"
+            return await update.message.reply_text("Напишите название кредита из таблицы:")
+    if step == "credit_name":
+        context.user_data["credit_name"] = t.strip(); context.user_data["step"] = "credit_payment"
+        return await update.message.reply_text("Введите ежемесячный платёж:")
+    if step == "credit_payment":
+        if not re.fullmatch(r"\d+(?:[.,]\d{1,2})?", t.strip()): return await update.message.reply_text("Введите сумму платежа, например 15000")
+        context.user_data["credit_monthly"] = t.replace(",", "."); context.user_data["step"] = "credit_balance"
+        return await update.message.reply_text("Введите остаток долга:")
+    if step == "credit_balance":
+        if not re.fullmatch(r"\d+(?:[.,]\d{1,2})?", t.strip()): return await update.message.reply_text("Введите остаток долга, например 120000")
+        sh = month_ws(); rows = sh.get("G3:G52"); row = next((i for i,r in enumerate(rows,3) if not r or not r[0]),53)
+        sh.update(f"G{row}:J{row}", [[context.user_data["credit_name"], "", float(context.user_data["credit_monthly"]), float(t.replace(",", "."))]], value_input_option="USER_ENTERED")
+        context.user_data.clear(); return await update.message.reply_text("Кредит добавлен в текущий месяц.")
+    if step == "credit_payment_name":
+        context.user_data["credit_name"] = t.strip(); context.user_data["step"] = "credit_payment_amount"
+        return await update.message.reply_text("Введите сумму внесённого платежа:")
+    if step == "credit_payment_amount":
+        if not re.fullmatch(r"\d+(?:[.,]\d{1,2})?", t.strip()): return await update.message.reply_text("Введите сумму платежа, например 15000")
+        sh = month_ws(); vals = sh.get("G3:L52")
+        for i,r in enumerate(vals,3):
+            if r and r[0] == context.user_data["credit_name"]:
+                sh.update(f"L{i}", [[float(t.replace(",", "."))]], value_input_option="USER_ENTERED")
+                context.user_data.clear(); return await update.message.reply_text("Платёж записан.")
+        return await update.message.reply_text("Кредит с таким названием не найден.")
     if t in ("Доход", "Расход"):
         context.user_data["kind"] = t
-        context.user_data["step"] = "amount"
+        context.user_data["step"] = "income_amount" if t == "Доход" else "amount"
         await update.message.reply_text("Введите сумму в рублях:")
+    elif context.user_data.get("step") == "income_source":
+        amount = context.user_data.get("amount")
+        add_income(amount, t.strip())
+        context.user_data.clear()
+        await update.message.reply_text(f"Доход записан: {t.strip()} — {amount} ₽")
+    elif context.user_data.get("step") == "income_amount":
+        if not re.fullmatch(r"\d+(?:[.,]\d{1,2})?", t.strip()): return await update.message.reply_text("Введите сумму, например 100000 или 1250.50")
+        context.user_data["amount"] = t.replace(",", "."); context.user_data["step"] = "income_source"
+        await update.message.reply_text("Напишите источник дохода, например: зарплата, подработка или премия:")
     elif context.user_data.get("step") == "amount":
         if not re.fullmatch(r"\d+(?:[.,]\d{1,2})?", t.strip()): return await update.message.reply_text("Введите сумму, например 400 или 1250.50")
         context.user_data["amount"] = t.replace(",", "."); context.user_data["step"] = "place"
@@ -51,10 +113,21 @@ async def text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await report(update)
 
 async def choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer(); idx=int(q.data.split(":")[1]); place=PLACES[idx]
-    amount=context.user_data["amount"]; kind=context.user_data.get("kind","Расход")
-    add_operation(kind, amount, place)
-    context.user_data.clear(); await q.edit_message_text(f"Записал: {place} — {amount} ₽")
+    q = update.callback_query
+    await q.answer()
+    try:
+        idx = int(q.data.split(":", 1)[1])
+        place = PLACES[idx]
+        amount = context.user_data.get("amount")
+        kind = context.user_data.get("kind", "Расход")
+        if not amount:
+            return await q.edit_message_text("Сессия ввода истекла. Нажмите «Расход» ещё раз.")
+        add_operation(kind, amount, place)
+        context.user_data.clear()
+        await q.edit_message_text(f"Записал: {place} — {amount} ₽")
+    except Exception:
+        logging.exception("Failed to save operation from category button")
+        await q.edit_message_text("Не удалось записать операцию в таблицу. Я сохранил ошибку в журнале, попробуйте ещё раз.")
 
 async def debts(update):
     sh=month_ws(); vals=sh.get("G3:L52"); lines=[]; total=0
@@ -67,7 +140,7 @@ async def report(update):
     sh=month_ws(); vals=sh.get("A3:E102"); total=0; groups={}
     for r in vals:
         if len(r)>=5 and r[1]=="Расход" and r[4]:
-            x=float(r[4].replace(",",".")); total+=x; groups[r[2]]=groups.get(r[2],0)+x
+            x=float(str(r[4]).replace(",",".")); total+=x; key=r[3] if len(r)>3 and r[3] else r[2]; groups[key]=groups.get(key,0)+x
     body="\n".join(f"{k}: {v:.2f} ₽" for k,v in sorted(groups.items(), key=lambda x:-x[1]))
     await update.message.reply_text(f"Расходы за день: {total:.2f} ₽\n{body or 'Расходов нет.'}")
 
